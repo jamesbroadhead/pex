@@ -35,6 +35,7 @@ class InstallerBase(object):
   SETUP_BOOTSTRAP_MODULE = "sys.path.insert(0, %(path)r); import %(module)s"
   SETUP_BOOTSTRAP_FOOTER = """
 __file__ = 'setup.py'
+sys.argv[0] = 'setup.py'
 exec(compile(open(__file__).read().replace('\\r\\n', '\\n'), __file__, 'exec'))
 """
 
@@ -189,7 +190,7 @@ class Installer(InstallerBase):
 class DistributionPackager(InstallerBase):
   def mixins(self):
     mixins = super(DistributionPackager, self).mixins().copy()
-    mixins.update(setuptools='setuptools>=1')
+    mixins.update(setuptools=SETUPTOOLS_REQUIREMENT)
     return mixins
 
   def find_distribution(self):

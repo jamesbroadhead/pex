@@ -44,7 +44,9 @@ class PEX(object):  # noqa: T000
       del os.environ['MACOSX_DEPLOYMENT_TARGET']
     except KeyError:
       pass
-    for key in filter(lambda key: key.startswith('PEX_'), os.environ):
+    # Cannot change dictionary size during __iter__
+    filter_keys = [key for key in os.environ if key.startswith('PEX_')]
+    for key in filter_keys:
       del os.environ[key]
 
   def __init__(self, pex=sys.argv[0], interpreter=None, env=ENV):
@@ -158,7 +160,7 @@ class PEX(object):  # noqa: T000
         TRACER.log('Tainted path element: %s' % path_element)
         site_distributions.update(all_distribution_paths(path_element))
       else:
-        TRACER.log('Not a tained path element: %s' % path_element, V=2)
+        TRACER.log('Not a tainted path element: %s' % path_element, V=2)
 
     user_site_distributions.update(all_distribution_paths(USER_SITE))
 
@@ -241,15 +243,10 @@ class PEX(object):  # noqa: T000
     new_sys_path, new_sys_path_importer_cache, new_sys_modules = cls.minimum_sys()
 
     patch_all(new_sys_path, new_sys_path_importer_cache, new_sys_modules)
+    yield
 
-    try:
-      yield
-    finally:
-      patch_all(old_sys_path, old_sys_path_importer_cache, old_sys_modules)
-
-  @classmethod
-  def _wrap_coverage(cls, runner, *args):
-    if 'PEX_COVERAGE' not in os.environ and 'PEX_COVERAGE_FILENAME' not in os.environ:
+  def _wrap_coverage(self, runner, *args):
+    if not self._vars.PEX_COVERAGE and self._vars.PEX_COVERAGE_FILENAME is None:
       runner(*args)
       return
 
@@ -258,8 +255,9 @@ class PEX(object):  # noqa: T000
     except ImportError:
       die('Could not bootstrap coverage module, aborting.')
 
-    if 'PEX_COVERAGE_FILENAME' in os.environ:
-      cov = coverage.coverage(data_file=os.environ['PEX_COVERAGE_FILENAME'])
+    pex_coverage_filename = self._vars.PEX_COVERAGE_FILENAME
+    if pex_coverage_filename is not None:
+      cov = coverage.coverage(data_file=pex_coverage_filename)
     else:
       cov = coverage.coverage(data_suffix=True)
 
@@ -274,14 +272,13 @@ class PEX(object):  # noqa: T000
 
       # TODO(wickman) Post-process coverage to elide $PEX_ROOT and make
       # the report more useful/less noisy.  #89
-      if 'PEX_COVERAGE_FILENAME' in os.environ:
+      if pex_coverage_filename:
         cov.save()
       else:
         cov.report(show_missing=False, ignore_errors=True, file=sys.stdout)
 
-  @classmethod
-  def _wrap_profiling(cls, runner, *args):
-    if 'PEX_PROFILE' not in os.environ and 'PEX_PROFILE_FILENAME' not in os.environ:
+  def _wrap_profiling(self, runner, *args):
+    if not self._vars.PEX_PROFILE and self._vars.PEX_PROFILE_FILENAME is None:
       runner(*args)
       return
 
@@ -295,10 +292,10 @@ class PEX(object):  # noqa: T000
     try:
       return profiler.runcall(runner, *args)
     finally:
-      if 'PEX_PROFILE_FILENAME' in os.environ:
-        profiler.dump_stats(os.environ['PEX_PROFILE_FILENAME'])
+      if self._vars.PEX_PROFILE_FILENAME is not None:
+        profiler.dump_stats(self._vars.PEX_PROFILE_FILENAME)
       else:
-        profiler.print_stats(sort=os.environ.get('PEX_PROFILE_SORT', 'cumulative'))
+        profiler.print_stats(sort=self._vars.PEX_PROFILE_SORT)
 
   def execute(self):
     """Execute the PEX.
@@ -306,6 +303,7 @@ class PEX(object):  # noqa: T000
     This function makes assumptions that it is the last function called by
     the interpreter.
     """
+    teardown_verbosity = self._vars.PEX_TEARDOWN_VERBOSE
     try:
       with self.patch_sys():
         working_set = self._activate()
@@ -323,20 +321,25 @@ class PEX(object):  # noqa: T000
     except SystemExit as se:
       # Print a SystemExit error message, avoiding a traceback in python3.
       # This must happen here, as sys.stderr is about to be torn down
-      if not isinstance(se.code, int):
+      if not isinstance(se.code, int) and se.code is not None:
         print(se.code, file=sys.stderr)
       raise
     finally:
       # squash all exceptions on interpreter teardown -- the primary type here are
       # atexit handlers failing to run because of things such as:
       #   http://stackoverflow.com/questions/2572172/referencing-other-modules-in-atexit
-      if not self._vars.PEX_TEARDOWN_VERBOSE:
+      if not teardown_verbosity:
         sys.stderr.flush()
         sys.stderr = DevNull()
         sys.excepthook = lambda *a, **kw: None
 
   def _execute(self):
-    if self._vars.PEX_INTERPRETER:
+    force_interpreter = self._vars.PEX_INTERPRETER
+
+    self.clean_environment()
+
+    if force_interpreter:
+      TRACER.log('PEX_INTERPRETER specified, dropping into interpreter')
       return self.execute_interpreter()
 
     if self._pex_info_overrides.script and self._pex_info_overrides.entry_point:
@@ -354,15 +357,10 @@ class PEX(object):  # noqa: T000
     elif self._pex_info.entry_point:
       return self.execute_entry(self._pex_info.entry_point)
     else:
+      TRACER.log('No entry point specified, dropping into interpreter')
       return self.execute_interpreter()
 
   def execute_interpreter(self):
-    force_interpreter = self._vars.PEX_INTERPRETER
-    # TODO(wickman) Is this necessary?
-    if force_interpreter:
-      self._vars.delete('PEX_INTERPRETER')
-    TRACER.log('%s, dropping into interpreter' % (
-        'PEX_INTERPRETER specified' if force_interpreter else 'No entry point specified'))
     if sys.argv[1:]:
       try:
         with open(sys.argv[1]) as fp:
@@ -376,13 +374,6 @@ class PEX(object):  # noqa: T000
       code.interact()
 
   def execute_script(self, script_name):
-    # TODO(wickman) This should be acheived by running clean_environment
-    # prior to invocation.  #90
-    if 'PEX_SCRIPT' in os.environ:
-      del os.environ['PEX_SCRIPT']
-
-    # TODO(wickman) PEXEnvironment should probably have a working_set property
-    # or possibly just __iter__.
     dists = list(self._activate())
 
     entry_point = get_entry_point_from_console_script(script_name, dists)
@@ -401,11 +392,10 @@ class PEX(object):  # noqa: T000
     try:
       ast = compile(content, name, 'exec', flags=0, dont_inherit=1)
     except SyntaxError:
-      die('Unable to parse %s.  PEX script support only supports Python scripts.')
+      die('Unable to parse %s.  PEX script support only supports Python scripts.' % name)
     old_name, old_file = globals().get('__name__'), globals().get('__file__')
     try:
-      old_argv0 = sys.argv[0]
-      sys.argv[0] = argv0
+      old_argv0, sys.argv[0] = sys.argv[0], argv0
       globals()['__name__'] = '__main__'
       globals()['__file__'] = name
       exec_function(ast, globals())
@@ -470,6 +460,9 @@ class PEX(object):  # noqa: T000
 
     cmdline = self.cmdline(args)
     TRACER.log('PEX.run invoking %s' % ' '.join(cmdline))
-    process = subprocess.Popen(cmdline, cwd=self._pex if with_chroot else os.getcwd(),
-                               preexec_fn=os.setsid if setsid else None, **kw)
+    process = subprocess.Popen(
+        cmdline,
+        cwd=self._pex if with_chroot else os.getcwd(),
+        preexec_fn=os.setsid if setsid else None,
+        **kw)
     return process.wait() if blocking else process
